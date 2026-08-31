@@ -141,7 +141,7 @@ npm run deploy                                # 构建并上传部署
 ## 📁 项目结构
 
 ```
-  nav-item-test/
+  nav-item-cf/
   ├── package.json                       # 根依赖 + 构建脚本
   ├── package-lock.json                  # 根依赖锁定
   ├── schema.sql                         # D1 建表 SQL + 默认数据
@@ -156,7 +156,7 @@ npm run deploy                                # 构建并上传部署
   │
   ├── functions/                         # Pages 后端（自动编译为 Worker）
   │   ├── api/
-  │   │   └── [[route]].js               # 全部 API 路由（登录、菜单、卡片、广告、友链、用户、设置、上传、数据备份 / 迁移）
+  │   │   └── [[route]].js               # 全部 API 路由（登录、菜单、卡片全局搜索、广告、友链、用户、设置、上传、数据备份 / 迁移）
   │   ├── lib/
   │   │   └── init.js                    # D1 数据库初始化 / 默认数据写入
   │   └── uploads/
@@ -174,7 +174,7 @@ npm run deploy                                # 构建并上传部署
       └── src/                           # 前端源码
           ├── main.js                    # Vue 应用入口
           ├── router.js                  # 路由配置
-          ├── api.js                     # API 接口封装
+          ├── api.js                     # API 接口封装（统一请求拦截器）
           ├── App.vue                    # 根组件
           ├── components/                # 公共组件
           │   ├── MenuBar.vue            # 顶部菜单栏组件
@@ -189,7 +189,8 @@ npm run deploy                                # 构建并上传部署
                   ├── FriendLinkManage.vue   # 友链管理
                   ├── UserManage.vue         # 用户管理
                   ├── ThemeManage.vue        # 主题与外观设置
-                  └── BackupManage.vue       # 数据备份 / 迁移页面
+                  ├── BackupManage.vue       # 数据备份 / 迁移页面
+                  └── admin-dark-theme.css   # 深色模式样式
 ```
 
 ## 📄 许可证
