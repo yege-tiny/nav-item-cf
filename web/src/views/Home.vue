@@ -21,9 +21,10 @@
         </div>
         <div class="search-container">
           <input 
+            ref="searchInputRef"
             v-model="searchQuery" 
             type="text" 
-            :placeholder="selectedEngine.placeholder" 
+            :placeholder="`${selectedEngine.placeholder} (按 / 聚焦)`" 
             class="search-input"
             @keyup.enter="handleSearch"
           />
@@ -110,11 +111,12 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue';
-import { getMenus, getCards, getAds, getFriends } from '../api';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { getMenus, getCards, getAds, getFriends, searchCards } from '../api';
 import MenuBar from '../components/MenuBar.vue';
 import CardGrid from '../components/CardGrid.vue';
 
+const searchInputRef = ref(null);
 const menus = ref([]);
 const activeMenu = ref(null);
 const activeSubMenu = ref(null);
@@ -125,6 +127,22 @@ const rightAds = ref([]);
 const showFriendLinks = ref(false);
 const friendLinks = ref([]);
 const bgUrl = ref('');
+
+// 键盘快捷键监听
+function handleGlobalKeyDown(e) {
+  if ((e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) || 
+      ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k')) {
+    e.preventDefault();
+    searchInputRef.value?.focus();
+    searchInputRef.value?.select();
+  } else if (e.key === 'Escape' && document.activeElement === searchInputRef.value) {
+    if (searchQuery.value) {
+      searchQuery.value = '';
+    } else {
+      searchInputRef.value?.blur();
+    }
+  }
+}
 
 // NOTE: 同步从 localStorage 读取缓存的背景图，避免页面加载时闪烁默认壁纸
 try {
@@ -206,47 +224,56 @@ const filteredCards = computed(() => {
 });
 
 onMounted(async () => {
-  // NOTE: 从 API 拉取最新站点设置并更新 localStorage 缓存
-  try {
-    const settingsRes = await fetch('/api/settings');
-    const settingsData = await settingsRes.json();
+  window.addEventListener('keydown', handleGlobalKeyDown);
+
+  // NOTE: 使用 Promise.allSettled 并行加载所有首屏数据，大幅减少白屏等待时间
+  const [settingsResult, menusResult, adsResult, friendsResult] = await Promise.allSettled([
+    fetch('/api/settings').then(r => r.json()),
+    getMenus(),
+    getAds(),
+    getFriends()
+  ]);
+
+  if (settingsResult.status === 'fulfilled') {
+    const settingsData = settingsResult.value;
     if (settingsData.code === 200 && settingsData.data) {
       const s = settingsData.data;
-      // 缓存到 localStorage 供下次加载时同步读取
       localStorage.setItem('siteSettings', JSON.stringify(s));
-      // 动态背景图：移动端优先使用移动端图，无则回退桌面端
       if (isMobile() && s.bg_mobile_value) {
         bgUrl.value = s.bg_mobile_value;
       } else if (s.bg_desktop_value) {
         bgUrl.value = s.bg_desktop_value;
       }
-      // 动态站点名称
       if (s.site_name) {
         document.title = s.site_name;
       }
-      // 动态 Favicon
       if (s.favicon_url) {
         const link = document.querySelector('link[rel="icon"]');
         if (link) link.href = s.favicon_url;
       }
     }
-  } catch (_e) {
-    // ignore, use cached or default background
   }
 
-  const res = await getMenus();
-  menus.value = res.data;
-  if (menus.value.length) {
-    activeMenu.value = menus.value[0];
-    loadCards();
+  if (menusResult.status === 'fulfilled') {
+    menus.value = menusResult.value.data;
+    if (menus.value.length) {
+      activeMenu.value = menus.value[0];
+      loadCards();
+    }
   }
-  // 加载广告
-  const adRes = await getAds();
-  leftAds.value = adRes.data.filter(ad => ad.position === 'left');
-  rightAds.value = adRes.data.filter(ad => ad.position === 'right');
-  
-  const friendRes = await getFriends();
-  friendLinks.value = friendRes.data;
+
+  if (adsResult.status === 'fulfilled') {
+    leftAds.value = adsResult.value.data.filter(ad => ad.position === 'left');
+    rightAds.value = adsResult.value.data.filter(ad => ad.position === 'right');
+  }
+
+  if (friendsResult.status === 'fulfilled') {
+    friendLinks.value = friendsResult.value.data;
+  }
+});
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleGlobalKeyDown);
 });
 
 async function selectMenu(menu, parentMenu = null) {
@@ -271,27 +298,22 @@ async function loadCards() {
 async function handleSearch() {
   if (!searchQuery.value.trim()) return;
   if (selectedEngine.value.name === 'site') {
-    // 站内搜索：遍历所有菜单，查找所有卡片
-    let found = false;
-    for (const menu of menus.value) {
-      const res = await getCards(menu.id);
-      const match = res.data.find(card =>
-        card.title.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
-        card.url.toLowerCase().includes(searchQuery.value.toLowerCase())
-      );
-      if (match) {
-        activeMenu.value = menu;
-        cards.value = res.data;
-        setTimeout(() => {
-          const el = document.querySelector(`[data-card-id='${match.id}']`);
-          if (el) el.scrollIntoView({behavior: 'smooth', block: 'center'});
-        }, 100);
-        found = true;
-        break;
+    try {
+      const res = await searchCards(searchQuery.value.trim());
+      const results = res.data;
+      if (results.length > 0) {
+        const firstResult = results[0];
+        const targetMenu = menus.value.find(m => m.id === firstResult.menu_id);
+        if (targetMenu) {
+          activeMenu.value = targetMenu;
+          activeSubMenu.value = null;
+        }
+        cards.value = results;
+      } else {
+        alert('未找到相关内容');
       }
-    }
-    if (!found) {
-      alert('未找到相关内容');
+    } catch (_e) {
+      alert('搜索出错，请稍后再试');
     }
   } else {
     const url = selectedEngine.value.url(searchQuery.value);

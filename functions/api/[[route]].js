@@ -21,10 +21,28 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-// ---------- 工具函数 ----------
+// ---------- 工具函数与安全配置 ----------
 function jwtSecret(env) {
-  return env.JWT_SECRET || 'your_jwt_secret_key';
+  return env.JWT_SECRET || 'nav-item-cf-jwt-secret-secure-key-2025';
 }
+
+// 登录防暴力破解：内存计数器
+const loginAttempts = new Map();
+const MAX_ATTEMPTS = 5;
+const LOCK_TIME_MS = 5 * 60 * 1000;
+
+// 允许上传的文件扩展名与 MIME 类型白名单
+const ALLOWED_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.svg', '.ico', '.gif']);
+const ALLOWED_IMAGE_MIMES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/svg+xml',
+  'image/x-icon',
+  'image/vnd.microsoft.icon',
+  'image/gif'
+]);
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
 
 // 认证中间件: 校验 Authorization: Bearer <token>
 async function auth(c, next) {
@@ -47,7 +65,7 @@ function getClientIp(c) {
     || '';
   if (ip.includes(',')) ip = ip.split(',')[0].trim();
   if (ip.startsWith('::ffff:')) ip = ip.replace('::ffff:', '');
-  return ip;
+  return ip || '127.0.0.1';
 }
 
 function getShanghaiTime() {
@@ -61,21 +79,56 @@ function getShanghaiTime() {
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
 }
 
+// ==================== 健康检查 ====================
+app.get('/health', (c) => {
+  return c.json({
+    status: 'ok',
+    platform: 'Cloudflare Pages / Workers',
+    timestamp: new Date().toISOString()
+  });
+});
+
 // ==================== 登录 ====================
 app.post('/login', async (c) => {
   const { username, password } = await c.req.json().catch(() => ({}));
-  const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
-  if (!user) return c.json({ error: '用户名或密码错误' }, 401);
+  const ip = getClientIp(c);
+  const nowMs = Date.now();
+
+  if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
+    return c.json({ error: '请输入有效的用户名和密码' }, 400);
+  }
+
+  // 检查 IP 登录频率限制
+  const attemptInfo = loginAttempts.get(ip);
+  if (attemptInfo && attemptInfo.count >= MAX_ATTEMPTS) {
+    if (nowMs - attemptInfo.lastAttempt < LOCK_TIME_MS) {
+      const remainingSec = Math.ceil((LOCK_TIME_MS - (nowMs - attemptInfo.lastAttempt)) / 1000);
+      return c.json({ error: `尝试次数过多，请 ${remainingSec} 秒后再试` }, 429);
+    } else {
+      loginAttempts.delete(ip);
+    }
+  }
+
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username.trim()).first();
+  if (!user) {
+    recordFailedAttempt(ip, nowMs);
+    return c.json({ error: '用户名或密码错误' }, 401);
+  }
 
   const ok = bcrypt.compareSync(password || '', user.password);
-  if (!ok) return c.json({ error: '用户名或密码错误' }, 401);
+  if (!ok) {
+    recordFailedAttempt(ip, nowMs);
+    return c.json({ error: '用户名或密码错误' }, 401);
+  }
+
+  // 登录成功，清除失败计数
+  loginAttempts.delete(ip);
 
   // 本次登录之前的记录 = 上次登录
   const lastLoginTime = user.last_login_time;
   const lastLoginIp = user.last_login_ip;
   // 本次登录
   const now = getShanghaiTime();
-  const ip = getClientIp(c);
   // 把原「本次」下移为「上次」，再写入新的「本次」
   await c.env.DB.prepare(
     'UPDATE users SET prev_login_time = ?, prev_login_ip = ?, last_login_time = ?, last_login_ip = ? WHERE id = ?'
@@ -94,19 +147,40 @@ app.post('/login', async (c) => {
   });
 });
 
+function recordFailedAttempt(ip, nowMs) {
+  const current = loginAttempts.get(ip) || { count: 0, lastAttempt: nowMs };
+  current.count += 1;
+  current.lastAttempt = nowMs;
+  loginAttempts.set(ip, current);
+}
+
 // ==================== 菜单 ====================
 app.get('/menus', async (c) => {
   const page = c.req.query('page');
   const pageSize = c.req.query('pageSize');
 
   if (!page && !pageSize) {
-    const menus = (await c.env.DB.prepare('SELECT * FROM menus ORDER BY "order"').all()).results;
-    const result = [];
-    for (const menu of menus) {
-      const subMenus = (await c.env.DB.prepare('SELECT * FROM sub_menus WHERE parent_id = ? ORDER BY "order"')
-        .bind(menu.id).all()).results;
-      result.push({ ...menu, subMenus });
-    }
+    // 消除 N+1 串行查询：一次性查询主菜单与子菜单并在内存中组装
+    const [menusRes, subMenusRes] = await Promise.all([
+      c.env.DB.prepare('SELECT * FROM menus ORDER BY "order" ASC, id ASC').all(),
+      c.env.DB.prepare('SELECT * FROM sub_menus ORDER BY "order" ASC, id ASC').all()
+    ]);
+    
+    const menus = menusRes.results || [];
+    const subMenus = subMenusRes.results || [];
+
+    const subMenuMap = {};
+    subMenus.forEach(sub => {
+      if (!subMenuMap[sub.parent_id]) subMenuMap[sub.parent_id] = [];
+      subMenuMap[sub.parent_id].push(sub);
+    });
+
+    const result = menus.map(menu => ({
+      ...menu,
+      subMenus: subMenuMap[menu.id] || []
+    }));
+
+    c.header('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
     return c.json(result);
   }
 
@@ -114,28 +188,35 @@ app.get('/menus', async (c) => {
   const size = parseInt(pageSize) || 10;
   const offset = (pageNum - 1) * size;
   const total = (await c.env.DB.prepare('SELECT COUNT(*) as total FROM menus').first()).total;
-  const rows = (await c.env.DB.prepare('SELECT * FROM menus ORDER BY "order" LIMIT ? OFFSET ?')
+  const rows = (await c.env.DB.prepare('SELECT * FROM menus ORDER BY "order" ASC, id ASC LIMIT ? OFFSET ?')
     .bind(size, offset).all()).results;
   return c.json({ total, page: pageNum, pageSize: size, data: rows });
 });
 
 app.get('/menus/:id/submenus', async (c) => {
-  const rows = (await c.env.DB.prepare('SELECT * FROM sub_menus WHERE parent_id = ? ORDER BY "order"')
+  const rows = (await c.env.DB.prepare('SELECT * FROM sub_menus WHERE parent_id = ? ORDER BY "order" ASC, id ASC')
     .bind(c.req.param('id')).all()).results;
+  c.header('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
   return c.json(rows);
 });
 
 app.post('/menus', auth, async (c) => {
   const { name, order } = await c.req.json();
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return c.json({ error: '菜单名称不能为空' }, 400);
+  }
   const r = await c.env.DB.prepare('INSERT INTO menus (name, "order") VALUES (?, ?)')
-    .bind(name, order || 0).run();
+    .bind(name.trim(), parseInt(order) || 0).run();
   return c.json({ id: r.meta.last_row_id });
 });
 
 app.put('/menus/:id', auth, async (c) => {
   const { name, order } = await c.req.json();
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return c.json({ error: '菜单名称不能为空' }, 400);
+  }
   const r = await c.env.DB.prepare('UPDATE menus SET name = ?, "order" = ? WHERE id = ?')
-    .bind(name, order || 0, c.req.param('id')).run();
+    .bind(name.trim(), parseInt(order) || 0, c.req.param('id')).run();
   return c.json({ changed: r.meta.changes });
 });
 
@@ -146,15 +227,21 @@ app.delete('/menus/:id', auth, async (c) => {
 
 app.post('/menus/:id/submenus', auth, async (c) => {
   const { name, order } = await c.req.json();
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return c.json({ error: '子菜单名称不能为空' }, 400);
+  }
   const r = await c.env.DB.prepare('INSERT INTO sub_menus (parent_id, name, "order") VALUES (?, ?, ?)')
-    .bind(c.req.param('id'), name, order || 0).run();
+    .bind(c.req.param('id'), name.trim(), parseInt(order) || 0).run();
   return c.json({ id: r.meta.last_row_id });
 });
 
 app.put('/menus/submenus/:id', auth, async (c) => {
   const { name, order } = await c.req.json();
+  if (!name || typeof name !== 'string' || !name.trim()) {
+    return c.json({ error: '子菜单名称不能为空' }, 400);
+  }
   const r = await c.env.DB.prepare('UPDATE sub_menus SET name = ?, "order" = ? WHERE id = ?')
-    .bind(name, order || 0, c.req.param('id')).run();
+    .bind(name.trim(), parseInt(order) || 0, c.req.param('id')).run();
   return c.json({ changed: r.meta.changes });
 });
 
@@ -164,19 +251,20 @@ app.delete('/menus/submenus/:id', auth, async (c) => {
 });
 
 // ==================== 卡片 ====================
-app.get('/cards/:menuId', async (c) => {
-  const subMenuId = c.req.query('subMenuId');
-  let rows;
-  if (subMenuId) {
-    rows = (await c.env.DB.prepare('SELECT * FROM cards WHERE sub_menu_id = ? ORDER BY "order"')
-      .bind(subMenuId).all()).results;
-  } else {
-    rows = (await c.env.DB.prepare('SELECT * FROM cards WHERE menu_id = ? AND sub_menu_id IS NULL ORDER BY "order"')
-      .bind(c.req.param('menuId')).all()).results;
-  }
+/**
+ * 全局搜索卡片（公开接口）
+ * NOTE: 必须放在 /cards/:menuId 之前，否则 Hono 会将 'search' 作为 menuId 匹配
+ */
+app.get('/cards/search', async (c) => {
+  const q = (c.req.query('q') || '').trim();
+  if (!q) return c.json([]);
+  const keyword = `%${q}%`;
+  const rows = (await c.env.DB.prepare(
+    'SELECT * FROM cards WHERE title LIKE ? OR url LIKE ? ORDER BY menu_id ASC, "order" ASC, id ASC'
+  ).bind(keyword, keyword).all()).results;
   rows.forEach(card => {
     if (!card.custom_logo_path) {
-      card.display_logo = card.logo_url || (card.url.replace(/\/+$/, '') + '/favicon.ico');
+      card.display_logo = card.logo_url || (card.url ? card.url.replace(/\/+$/, '') + '/favicon.ico' : '');
     } else {
       card.display_logo = '/uploads/' + card.custom_logo_path;
     }
@@ -184,19 +272,46 @@ app.get('/cards/:menuId', async (c) => {
   return c.json(rows);
 });
 
+app.get('/cards/:menuId', async (c) => {
+  const subMenuId = c.req.query('subMenuId');
+  let rows;
+  if (subMenuId) {
+    rows = (await c.env.DB.prepare('SELECT * FROM cards WHERE sub_menu_id = ? ORDER BY "order" ASC, id ASC')
+      .bind(subMenuId).all()).results;
+  } else {
+    rows = (await c.env.DB.prepare('SELECT * FROM cards WHERE menu_id = ? AND (sub_menu_id IS NULL OR sub_menu_id = 0) ORDER BY "order" ASC, id ASC')
+      .bind(c.req.param('menuId')).all()).results;
+  }
+  rows.forEach(card => {
+    if (!card.custom_logo_path) {
+      card.display_logo = card.logo_url || (card.url ? card.url.replace(/\/+$/, '') + '/favicon.ico' : '');
+    } else {
+      card.display_logo = '/uploads/' + card.custom_logo_path;
+    }
+  });
+  c.header('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
+  return c.json(rows);
+});
+
 app.post('/cards', auth, async (c) => {
   const { menu_id, sub_menu_id, title, url, logo_url, custom_logo_path, desc, order } = await c.req.json();
+  if (!title || !url) {
+    return c.json({ error: '卡片名称和链接地址不能为空' }, 400);
+  }
   const r = await c.env.DB.prepare(
     'INSERT INTO cards (menu_id, sub_menu_id, title, url, logo_url, custom_logo_path, desc, "order") VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(menu_id ?? null, sub_menu_id || null, title, url, logo_url ?? null, custom_logo_path ?? null, desc ?? null, order || 0).run();
+  ).bind(menu_id ?? null, sub_menu_id || null, title.trim(), url.trim(), logo_url ?? null, custom_logo_path ?? null, desc ?? null, parseInt(order) || 0).run();
   return c.json({ id: r.meta.last_row_id });
 });
 
 app.put('/cards/:id', auth, async (c) => {
   const { menu_id, sub_menu_id, title, url, logo_url, custom_logo_path, desc, order } = await c.req.json();
+  if (!title || !url) {
+    return c.json({ error: '卡片名称和链接地址不能为空' }, 400);
+  }
   const r = await c.env.DB.prepare(
     'UPDATE cards SET menu_id = ?, sub_menu_id = ?, title = ?, url = ?, logo_url = ?, custom_logo_path = ?, desc = ?, "order" = ? WHERE id = ?'
-  ).bind(menu_id ?? null, sub_menu_id || null, title, url, logo_url ?? null, custom_logo_path ?? null, desc ?? null, order || 0, c.req.param('id')).run();
+  ).bind(menu_id ?? null, sub_menu_id || null, title.trim(), url.trim(), logo_url ?? null, custom_logo_path ?? null, desc ?? null, parseInt(order) || 0, c.req.param('id')).run();
   return c.json({ changed: r.meta.changes });
 });
 
@@ -206,7 +321,6 @@ app.delete('/cards/:id', auth, async (c) => {
 });
 
 // ==================== 文件上传（R2） ====================
-// 根据上传目标返回文件名前缀，用于区分不同用途的图片（各自独立展示，互不混淆）
 function themePrefix(target) {
   return target === 'favicon' ? 'favicon-'
     : target === 'mobile' ? 'bg-mobile-'
@@ -216,21 +330,33 @@ function themePrefix(target) {
 async function saveToR2(c, field, prefix) {
   const body = await c.req.parseBody();
   const file = body[field];
-  if (!file || typeof file === 'string') return null;
+  if (!file || typeof file === 'string') return { error: '未接收到上传文件' };
+
+  if (file.size > MAX_FILE_SIZE) {
+    return { error: '文件大小超过限制 (最大 5MB)' };
+  }
+
   const name = file.name || '';
   const dot = name.lastIndexOf('.');
-  const ext = dot >= 0 ? name.slice(dot) : '';
-  const filename = `${prefix}${Date.now()}${ext}`;
+  const ext = dot >= 0 ? name.slice(dot).toLowerCase() : '';
+  
+  if (!ALLOWED_IMAGE_EXTS.has(ext) && !ALLOWED_IMAGE_MIMES.has(file.type)) {
+    return { error: '仅支持上传常见图片文件 (PNG, JPG, WEBP, SVG, ICO, GIF)' };
+  }
+
+  const cleanExt = ALLOWED_IMAGE_EXTS.has(ext) ? ext : '.png';
+  const filename = `${prefix}${Date.now()}-${Math.random().toString(36).slice(2, 8)}${cleanExt}`;
+  
   await c.env.BUCKET.put(filename, await file.arrayBuffer(), {
-    httpMetadata: { contentType: file.type || 'application/octet-stream' }
+    httpMetadata: { contentType: file.type || 'image/png' }
   });
-  return filename;
+  return { filename };
 }
 
 app.post('/upload', auth, async (c) => {
-  const filename = await saveToR2(c, 'logo', '');
-  if (!filename) return c.json({ error: 'No file uploaded' }, 400);
-  return c.json({ filename, url: '/uploads/' + filename });
+  const result = await saveToR2(c, 'logo', '');
+  if (result.error) return c.json({ error: result.error }, 400);
+  return c.json({ filename: result.filename, url: '/uploads/' + result.filename });
 });
 
 // ==================== 广告 ====================
@@ -239,6 +365,7 @@ app.get('/ads', async (c) => {
   const pageSize = c.req.query('pageSize');
   if (!page && !pageSize) {
     const rows = (await c.env.DB.prepare('SELECT * FROM ads').all()).results;
+    c.header('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
     return c.json(rows);
   }
   const pageNum = parseInt(page) || 1;
@@ -274,6 +401,7 @@ app.get('/friends', async (c) => {
   const pageSize = c.req.query('pageSize');
   if (!page && !pageSize) {
     const rows = (await c.env.DB.prepare('SELECT * FROM friends').all()).results;
+    c.header('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
     return c.json(rows);
   }
   const pageNum = parseInt(page) || 1;
@@ -358,6 +486,7 @@ app.get('/settings', async (c) => {
   const rows = (await c.env.DB.prepare('SELECT key, value FROM site_settings').all()).results;
   const settings = {};
   rows.forEach(row => { settings[row.key] = row.value; });
+  c.header('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
   return c.json({ code: 200, data: settings });
 });
 
@@ -386,9 +515,9 @@ app.put('/settings', auth, async (c) => {
 
 app.post('/settings/upload-bg', auth, async (c) => {
   const body = await c.req.parseBody();
-  const filename = await saveToR2(c, 'bg', themePrefix(body.target));
-  if (!filename) return c.json({ code: 400, message: '未选择文件' }, 400);
-  return c.json({ code: 200, data: { url: '/uploads/' + filename } });
+  const result = await saveToR2(c, 'bg', themePrefix(body.target));
+  if (result.error) return c.json({ code: 400, message: result.error }, 400);
+  return c.json({ code: 200, data: { url: '/uploads/' + result.filename } });
 });
 
 // 列出某个目标（favicon/desktop/mobile）已上传的图片，仅返回该用途的图片
@@ -421,6 +550,16 @@ app.delete('/settings/uploads/:key', auth, async (c) => {
 // 导入: 清空上述表后按备份内容重写；users 表不受影响
 const BACKUP_VERSION = 1;
 const BACKUP_TABLES = ['menus', 'sub_menus', 'cards', 'ads', 'friends', 'site_settings'];
+
+// NOTE: 每张表允许写入的列名白名单，防止导入时通过恶意 JSON 列名注入 SQL
+const TABLE_COLUMNS = {
+  menus:         new Set(['id', 'name', 'order']),
+  sub_menus:     new Set(['id', 'parent_id', 'name', 'order']),
+  cards:         new Set(['id', 'menu_id', 'sub_menu_id', 'title', 'url', 'logo_url', 'custom_logo_path', 'desc', 'order']),
+  ads:           new Set(['id', 'position', 'img', 'url']),
+  friends:       new Set(['id', 'title', 'url', 'logo']),
+  site_settings: new Set(['id', 'key', 'value']),
+};
 
 app.get('/backup/export', auth, async (c) => {
   const data = {};
@@ -463,9 +602,11 @@ app.post('/backup/import', auth, async (c) => {
 
   let inserted = 0;
   for (const t of BACKUP_TABLES) {
+    const allowedCols = TABLE_COLUMNS[t];
     const rows = Array.isArray(data[t]) ? data[t] : [];
     for (const row of rows) {
-      const cols = Object.keys(row);
+      // 仅保留白名单内的列名，过滤掉恶意注入的列
+      const cols = Object.keys(row).filter(c => allowedCols.has(c));
       if (cols.length === 0) continue;
       const placeholders = cols.map(() => '?').join(', ');
       const quoted = cols.map((col) => `"${col}"`).join(', ');
